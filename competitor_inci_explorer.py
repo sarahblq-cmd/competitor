@@ -208,16 +208,14 @@ if submitted:
             "category": prod_cat, "product_type": prod_type, "notes": prod_notes
         }
 
-        # Split INCI list
-        tokens = []
-        for line in inci_raw.replace("
-", "
-").split("
-"):
-            for part in line.split(","):
-                name = part.strip()
-                if name:
-                    tokens.append(name)
+       # Split INCI list
+tokens = []
+for line in inci_raw.replace("\r", "\n").split("\n"):
+    for part in line.split(","):
+        name = part.strip()
+        if name:
+            tokens.append(name)
+
 
         # Prepare next IDs
         next_ing_id = 1 if df_ings.empty else int(pd.to_numeric(df_ings["id"], errors='coerce').max()) + 1
