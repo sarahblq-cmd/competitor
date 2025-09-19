@@ -184,37 +184,23 @@ with st.form("add_competitor"):
 if submitted:
     try:
         # Ensure brand
-        exists = df_brands[df_brands.get("name", pd.Series(dtype=str)).str.lower()==brand_name.lower()] if not df_brands.empty else pd.DataFrame()
-        if exists.empty:
-            next_bid = 1 if df_brands.empty else int(pd.to_numeric(df_brands["id"], errors='coerce').max()) + 1
-            append_row(ws_brands, {"id": next_bid, "name": brand_name})
-            df_brands.loc[len(df_brands)] = {"id": next_bid, "name": brand_name}
-            bid = next_bid
-        else:
-            bid = int(exists.iloc[0]["id"])
+        ...
+        # Split INCI list
+        tokens = []
+        for line in inci_raw.replace("\r", "\n").split("\n"):
+            for part in line.split(","):
+                name = part.strip()
+                if name:
+                    tokens.append(name)
 
-        # Add product
-        next_pid = 1 if df_prods.empty else int(pd.to_numeric(df_prods["id"], errors='coerce').max()) + 1
-        append_row(ws_prods, {
-            "id": next_pid,
-            "brand_id": bid,
-            "product_name": prod_name,
-            "category": prod_cat,
-            "product_type": prod_type,
-            "notes": prod_notes
-        })
-        df_prods.loc[len(df_prods)] = {
-            "id": next_pid, "brand_id": bid, "product_name": prod_name,
-            "category": prod_cat, "product_type": prod_type, "notes": prod_notes
-        }
+        # process tokens...
 
-       # Split INCI list
-tokens = []
-for line in inci_raw.replace("\r", "\n").split("\n"):
-    for part in line.split(","):
-        name = part.strip()
-        if name:
-            tokens.append(name)
+        st.cache_data.clear()
+        st.success(f"Saved product '{prod_name}' with {len(tokens)} ingredients.")
+
+    except Exception as e:
+        st.error(f"Failed to save: {e}")
+
 
 
         # Prepare next IDs
