@@ -1,13 +1,44 @@
-# app_competitor.py — Competitor INCI Explorer (Google Sheets backend)
-# ------------------------------------------------------------
-# Features
-# - Add competitor product info (brand, product name, category, type)
-# - Paste INCI list (comma/newline separated)
-# - Auto-link each INCI into Ingredients master table
-# - Explore by category/product type → see detailed competitor INCI usage
-# - Ingredient frequency analysis
+# app_competitor.py — Competitor INCI Explorer (Google Sheets backend, cached)
+# ---------------------------------------------------------------------------
+# What this does
+# - Add competitor products (brand, product name, category, product_type)
+# - Paste INCI list (comma/newline) → auto-links to Ingredients master
+# - Explore products by Category / Product Type; view detailed INCI + functions
+# - Ingredient frequency across selected scope
+# - Caching to avoid Google Sheets 429 (quota) with manual Refresh button
+# - Diagnostics expander to verify connection/tabs
+#
+# Requirements (requirements.txt)
+#   streamlit
+#   pandas
+#   gspread
+#   google-auth
+#
+# Secrets (local: .streamlit/secrets.toml; Cloud: App → Settings → Secrets)
+# [gsheets]
+# spreadsheet_id = "YOUR_SHEET_ID"
+# [gsheets.service_account]
+# type = "service_account"
+# project_id = "..."
+# private_key_id = "..."
+# private_key = """
+# -----BEGIN PRIVATE KEY-----
+# (full multi-line key)
+# -----END PRIVATE KEY-----
+# """
+# client_email = "...@...iam.gserviceaccount.com"
+# client_id = "..."
+# auth_uri = "https://accounts.google.com/o/oauth2/auth"
+# token_uri = "https://oauth2.googleapis.com/token"
+# auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+# client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
+# ---------------------------------------------------------------------------
 
 import json
+import time
+from functools import wraps
+from typing import Dict, Any
+
 import pandas as pd
 import streamlit as st
 import gspread
@@ -16,101 +47,110 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Competitor INCI Explorer", layout="wide")
 st.title("🔎 Competitor INCI Explorer")
 
-# ------------------------------
-# Google Sheets Client
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Quota-friendly: retry helper + caching layers
+# ---------------------------------------------------------------------------
 
-def get_client():
-    cfg = st.secrets.get("gsheets")
-    if not cfg:
-        st.error("Secrets missing: [gsheets] not found.")
-        st.stop()
+def with_backoff(fn):
+    @wraps(fn)
+    def _inner(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            if "429" in str(e):
+                time.sleep(1.5)
+                return fn(*args, **kwargs)
+            raise
+    return _inner
 
-    sa = cfg.get("service_account")
-    if isinstance(sa, str):
-        sa_info = json.loads(sa)
-    else:
-        sa_info = sa
-
-    sid = cfg.get("spreadsheet_id")
-    if not sid or "/" in sid:
-        st.error("Use only the spreadsheet ID, not the full URL.")
-        st.stop()
-
-    scopes = [
+@st.cache_resource
+def get_gc_and_sheet():
+    cfg = st.secrets["gsheets"]
+    sa = cfg["service_account"] if isinstance(cfg["service_account"], dict) else json.loads(cfg["service_account"])
+    creds = Credentials.from_service_account_info(sa, scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        "https://www.googleapis.com/auth/drive",
+    ])
     gc = gspread.authorize(creds)
-    return gc, sid
+    sh = gc.open_by_key(cfg["spreadsheet_id"])
+    return gc, sh
 
 TEMPLATE = {
     "Brands": ["id", "name"],
     "Products": ["id", "brand_id", "product_name", "category", "product_type", "notes"],
     "Ingredients": ["id", "inci_name", "default_function", "cas"],
-    "Product_Ingredients": ["id", "product_id", "ingredient_id", "inci_name_raw", "function_override", "percentage", "notes"]
+    "Product_Ingredients": ["id", "product_id", "ingredient_id", "inci_name_raw", "function_override", "percentage", "notes"],
 }
 
-def ws_to_df(ws):
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame(columns=[])
-    headers = values[0]
-    rows = values[1:]
+@st.cache_data(ttl=60)
+@with_backoff
+def load_tab(name: str):
+    _, sh = get_gc_and_sheet()
+    tabs = [ws.title for ws in sh.worksheets()]
+    if name not in tabs:
+        ws = sh.add_worksheet(title=name, rows=2000, cols=20)
+        ws.append_row(TEMPLATE[name])
+    else:
+        ws = sh.worksheet(name)
+    vals = ws.get_all_values()
+    headers = vals[0] if vals else TEMPLATE[name]
+    rows = vals[1:] if len(vals) > 1 else []
     df = pd.DataFrame(rows, columns=headers)
-    for col in ["id","brand_id","ingredient_id","product_id","percentage"]:
+    for col in ["id","brand_id","product_id","ingredient_id","percentage"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+    return ws, df
 
-def df_append(ws, row):
+@with_backoff
+def append_row(ws, row: Dict[str, Any]):
     headers = ws.row_values(1)
-    out = [str(row.get(h, "")) for h in headers]
-    ws.append_row(out)
+    ws.append_row([str(row.get(h, "")) for h in headers])
 
-# Starter auto-function mapping (expand as needed)
+# Starter function mapping (expand as you go)
 FUNCTION_MAP = {
     "aqua": "Solvent",
     "water": "Solvent",
-    "dimethicone": "Emollient",
-    "cyclopentasiloxane": "Emollient",
-    "ethylhexyl methoxycinnamate": "UV Filter",
-    "titanium dioxide": "UV Filter",
     "glycerin": "Humectant",
     "butylene glycol": "Humectant",
+    "dimethicone": "Emollient",
+    "cyclopentasiloxane": "Emollient",
+    "titanium dioxide": "UV Filter",
+    "ethylhexyl methoxycinnamate": "UV Filter",
     "phenoxyethanol": "Preservative",
     "ethylhexylglycerin": "Preservative booster",
 }
 
-# ------------------------------
-# Connect and Load
-# ------------------------------
-try:
-    gc, SSID = get_client()
-    sh = gc.open_by_key(SSID)
-    tabs = [ws.title for ws in sh.worksheets()]
-    # Ensure tabs exist
-    for t in TEMPLATE:
-        if t not in tabs:
-            sh.add_worksheet(title=t, rows=1000, cols=20)
-            sh.worksheet(t).append_row(TEMPLATE[t])
-    ws_brands = sh.worksheet("Brands")
-    ws_prods = sh.worksheet("Products")
-    ws_ings = sh.worksheet("Ingredients")
-    ws_pi = sh.worksheet("Product_Ingredients")
+# ---------------------------------------------------------------------------
+# Diagnostics (on-demand)
+# ---------------------------------------------------------------------------
+with st.expander("🧪 Diagnostics"):
+    if st.button("Run connectivity check"):
+        try:
+            _, sh = get_gc_and_sheet()
+            st.success("Connected to spreadsheet.")
+            st.write("Tabs:", [w.title for w in sh.worksheets()])
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
 
-    df_brands = ws_to_df(ws_brands)
-    df_prods = ws_to_df(ws_prods)
-    df_ings = ws_to_df(ws_ings)
-    df_pi = ws_to_df(ws_pi)
+# Sidebar controls: Filters + Refresh
+with st.sidebar:
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.experimental_rerun()
+
+# Load tabs (cached)
+try:
+    ws_brands, df_brands = load_tab("Brands")
+    ws_prods, df_prods = load_tab("Products")
+    ws_ings,  df_ings  = load_tab("Ingredients")
+    ws_pi,    df_pi    = load_tab("Product_Ingredients")
 except Exception as e:
-    st.error(f"❌ Could not connect to Google Sheets: {e}")
+    st.error(f"❌ Could not connect/load: {e}")
     st.stop()
 
-# ------------------------------
+# ---------------------------------------------------------------------------
 # Sidebar Filters
-# ------------------------------
+# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Filters")
     cats = ["(All)"] + sorted([c for c in df_prods.get("category", pd.Series(dtype=str)).dropna().unique().tolist() if c])
@@ -124,9 +164,9 @@ with st.sidebar:
     sel_ptype = st.selectbox("Product Type", ptypes)
     sel_ptype_q = None if sel_ptype == "(All)" else sel_ptype
 
-# ------------------------------
-# Data Entry Form
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Data Entry: Add Competitor Product
+# ---------------------------------------------------------------------------
 st.markdown("---")
 st.header("➕ Add Competitor Product")
 with st.form("add_competitor"):
@@ -143,19 +183,19 @@ with st.form("add_competitor"):
 
 if submitted:
     try:
-        # Ensure brand exists
-        exists = df_brands[df_brands["name"].str.lower()==brand_name.lower()] if not df_brands.empty else pd.DataFrame()
+        # Ensure brand
+        exists = df_brands[df_brands.get("name", pd.Series(dtype=str)).str.lower()==brand_name.lower()] if not df_brands.empty else pd.DataFrame()
         if exists.empty:
-            next_bid = 1 if df_brands.empty else int(pd.to_numeric(df_brands["id"], errors='coerce').max())+1
-            df_append(ws_brands, {"id": next_bid, "name": brand_name})
+            next_bid = 1 if df_brands.empty else int(pd.to_numeric(df_brands["id"], errors='coerce').max()) + 1
+            append_row(ws_brands, {"id": next_bid, "name": brand_name})
             df_brands.loc[len(df_brands)] = {"id": next_bid, "name": brand_name}
             bid = next_bid
         else:
             bid = int(exists.iloc[0]["id"])
 
         # Add product
-        next_pid = 1 if df_prods.empty else int(pd.to_numeric(df_prods["id"], errors='coerce').max())+1
-        df_append(ws_prods, {
+        next_pid = 1 if df_prods.empty else int(pd.to_numeric(df_prods["id"], errors='coerce').max()) + 1
+        append_row(ws_prods, {
             "id": next_pid,
             "brand_id": bid,
             "product_name": prod_name,
@@ -163,33 +203,45 @@ if submitted:
             "product_type": prod_type,
             "notes": prod_notes
         })
-        df_prods.loc[len(df_prods)] = {"id": next_pid, "brand_id": bid, "product_name": prod_name,
-                                       "category": prod_cat, "product_type": prod_type, "notes": prod_notes}
+        df_prods.loc[len(df_prods)] = {
+            "id": next_pid, "brand_id": bid, "product_name": prod_name,
+            "category": prod_cat, "product_type": prod_type, "notes": prod_notes
+        }
 
         # Split INCI list
         tokens = []
-        for line in inci_raw.replace("\r", "\n").split("\n"):
+        for line in inci_raw.replace("
+", "
+").split("
+"):
             for part in line.split(","):
                 name = part.strip()
                 if name:
                     tokens.append(name)
 
-        next_ing_id = 1 if df_ings.empty else int(pd.to_numeric(df_ings["id"], errors='coerce').max())+1
-        next_pi_id = 1 if df_pi.empty else int(pd.to_numeric(df_pi["id"], errors='coerce').max())+1
+        # Prepare next IDs
+        next_ing_id = 1 if df_ings.empty else int(pd.to_numeric(df_ings["id"], errors='coerce').max()) + 1
+        next_pi_id  = 1 if df_pi.empty   else int(pd.to_numeric(df_pi["id"],   errors='coerce').max()) + 1
 
         for inci in tokens:
             inci_norm = inci.strip()
-            exists = df_ings[df_ings["inci_name"].str.lower()==inci_norm.lower()] if not df_ings.empty else pd.DataFrame()
-            if exists.empty:
+            row_match = df_ings[df_ings.get("inci_name", pd.Series(dtype=str)).str.lower()==inci_norm.lower()] if not df_ings.empty else pd.DataFrame()
+            if row_match.empty:
                 func = FUNCTION_MAP.get(inci_norm.lower(), "")
-                df_append(ws_ings, {"id": next_ing_id, "inci_name": inci_norm, "default_function": func, "cas": ""})
+                append_row(ws_ings, {"id": next_ing_id, "inci_name": inci_norm, "default_function": func, "cas": ""})
                 df_ings.loc[len(df_ings)] = {"id": next_ing_id, "inci_name": inci_norm, "default_function": func, "cas": ""}
                 ing_id = next_ing_id
                 next_ing_id += 1
             else:
-                ing_id = int(exists.iloc[0]["id"])
+                ing_id = int(row_match.iloc[0]["id"]) if pd.notna(row_match.iloc[0]["id"]) else None
+                if ing_id is None:
+                    func = FUNCTION_MAP.get(inci_norm.lower(), "")
+                    append_row(ws_ings, {"id": next_ing_id, "inci_name": inci_norm, "default_function": func, "cas": ""})
+                    df_ings.loc[len(df_ings)] = {"id": next_ing_id, "inci_name": inci_norm, "default_function": func, "cas": ""}
+                    ing_id = next_ing_id
+                    next_ing_id += 1
 
-            df_append(ws_pi, {
+            append_row(ws_pi, {
                 "id": next_pi_id,
                 "product_id": next_pid,
                 "ingredient_id": ing_id,
@@ -198,17 +250,21 @@ if submitted:
                 "percentage": "",
                 "notes": ""
             })
-            df_pi.loc[len(df_pi)] = {"id": next_pi_id, "product_id": next_pid, "ingredient_id": ing_id,
-                                     "inci_name_raw": inci_norm, "function_override": "", "percentage": "", "notes": ""}
+            df_pi.loc[len(df_pi)] = {
+                "id": next_pi_id, "product_id": next_pid, "ingredient_id": ing_id,
+                "inci_name_raw": inci_norm, "function_override": "", "percentage": "", "notes": ""
+            }
             next_pi_id += 1
 
+        # Clear cached data so UI reflects updates
+        st.cache_data.clear()
         st.success(f"Saved product '{prod_name}' with {len(tokens)} ingredients.")
     except Exception as e:
         st.error(f"Failed to save: {e}")
 
-# ------------------------------
-# Explore
-# ------------------------------
+# ---------------------------------------------------------------------------
+# Explore view
+# ---------------------------------------------------------------------------
 st.markdown("---")
 st.header("📊 Explore Competitor Products")
 
@@ -232,9 +288,9 @@ if sel_ids:
         show.columns = ["INCI","Default Function","Override Function","%","Notes"]
         st.dataframe(show.reset_index(drop=True), use_container_width=True, hide_index=True)
 
-# ------------------------------
+# ---------------------------------------------------------------------------
 # Ingredient Frequency
-# ------------------------------
+# ---------------------------------------------------------------------------
 st.markdown("---")
 st.subheader("Ingredient Frequency in Current Scope")
 
