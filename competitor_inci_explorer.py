@@ -50,6 +50,28 @@ st.title("🔎 Competitor INCI Explorer")
 # ---------------------------------------------------------------------------
 # Quota-friendly: retry helper + caching layers
 # ---------------------------------------------------------------------------
+from collections.abc import Mapping  # add this at top with other imports
+import json
+
+def get_service_account_info():
+    cfg = st.secrets["gsheets"]
+    sa = cfg.get("service_account")
+
+    if isinstance(sa, str):
+        # JSON string case (when you pasted raw JSON into secrets)
+        return json.loads(sa)
+    elif isinstance(sa, Mapping):
+        # TOML table case (AttrDict) → convert to normal dict
+        return dict(sa)
+    else:
+        raise TypeError(f"Unsupported service_account type: {type(sa)}")
+        
+sa_info = get_service_account_info()
+creds = Credentials.from_service_account_info(sa_info, scopes=[
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+])
+gc = gspread.authorize(creds)
 
 def with_backoff(fn):
     @wraps(fn)
