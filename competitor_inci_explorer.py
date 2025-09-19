@@ -136,7 +136,11 @@ with st.expander("🧪 Diagnostics"):
 with st.sidebar:
     if st.button("🔄 Refresh data"):
         st.cache_data.clear()
-        st.experimental_rerun()
+        if hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            st.experimental_rerun()
+
 
 # Load tabs (cached)
 try:
